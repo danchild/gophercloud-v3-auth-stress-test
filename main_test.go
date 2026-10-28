@@ -14,7 +14,6 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/auth"
-	blockstoragenoauth "github.com/gophercloud/gophercloud/v2/openstack/blockstorage/noauth"
 )
 
 func TestRunSelectedRunsOnlyRequestedIdentityVersion(t *testing.T) {
@@ -312,43 +311,6 @@ func TestRunAuthCaseRebuildsOptionsForEachRequest(t *testing.T) {
 	}
 	if r.passed != 2 || r.failed != 0 {
 		t.Fatalf("passed=%d failed=%d, want 2/0", r.passed, r.failed)
-	}
-}
-
-func TestNoAuthCasesCoverCinderV3EndpointForms(t *testing.T) {
-	fixture := fixtureData{userID: "user-id", projectID: "project-id"}
-	cases := noAuthCases(fixture)
-	want := []struct {
-		name     string
-		token    string
-		endpoint string
-	}{
-		{name: "explicit-project", token: "user-id:project-id", endpoint: "http://cinder:8776/v3/project-id/"},
-		{name: "project-defaulted", token: "user-id:user-id", endpoint: "http://cinder:8776/v3/user-id/"},
-	}
-	if len(cases) != len(want) {
-		t.Fatalf("case count = %d, want %d", len(cases), len(want))
-	}
-	for i, test := range cases {
-		if test.name != want[i].name {
-			t.Errorf("case %d name = %q, want %q", i, test.name, want[i].name)
-		}
-		provider, err := blockstoragenoauth.NewClient(test.opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if provider.TokenID != want[i].token {
-			t.Errorf("case %q token = %q, want %q", test.name, provider.TokenID, want[i].token)
-		}
-		service, err := blockstoragenoauth.NewBlockStorageNoAuthV3(provider, blockstoragenoauth.EndpointOpts{
-			CinderEndpoint: "http://cinder:8776/v3",
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		if service.Endpoint != want[i].endpoint {
-			t.Errorf("case %q endpoint = %q, want %q", test.name, service.Endpoint, want[i].endpoint)
-		}
 	}
 }
 

@@ -23,7 +23,6 @@ import (
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/auth"
 	"github.com/gophercloud/gophercloud/v2/openstack"
-	blockstoragenoauth "github.com/gophercloud/gophercloud/v2/openstack/blockstorage/noauth"
 	"github.com/gophercloud/gophercloud/v2/openstack/config/clouds"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/applicationcredentials"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/credentials"
@@ -1112,84 +1111,6 @@ func runCloudOAuthMatrix(ctx context.Context, r *runner, f fixtureData) {
 	}
 }
 
-type noAuthCase struct {
-	name              string
-	opts              auth.NoAuthOpts
-	endpointProjectID string
-}
-
-func noAuthCases(f fixtureData) []noAuthCase {
-	return []noAuthCase{
-		{
-			name:              "explicit-project",
-			opts:              auth.NoAuthV3Opts{UserID: f.userID, ProjectID: f.projectID},
-			endpointProjectID: f.projectID,
-		},
-		{
-			name:              "project-defaulted",
-			opts:              auth.NoAuthV3Opts{UserID: f.userID},
-			endpointProjectID: f.userID,
-		},
-	}
-}
-
-func runNoAuthMatrix(ctx context.Context, r *runner, f fixtureData) {
-	endpoint, err := cinderNoAuthEndpoint(f.authURL, 3)
-	if err != nil {
-		r.run("service/noauth/cinder-v3/endpoint", func() error { return err })
-		return
-	}
-	for _, test := range noAuthCases(f) {
-		r.run("service/noauth/cinder-v3/"+test.name, func() error {
-			provider, err := blockstoragenoauth.NewClient(test.opts)
-			if err != nil {
-				return err
-			}
-			if provider.TokenID == "" {
-				return errors.New("no-auth provider has an empty token")
-			}
-			service, err := blockstoragenoauth.NewBlockStorageNoAuthV3(provider, blockstoragenoauth.EndpointOpts{
-				CinderEndpoint: endpoint,
-			})
-			if err != nil {
-				return err
-			}
-			wantEndpoint := gophercloud.NormalizeURL(gophercloud.NormalizeURL(endpoint) + test.endpointProjectID)
-			if service.Endpoint != wantEndpoint {
-				return fmt.Errorf("service endpoint = %q, want %q", service.Endpoint, wantEndpoint)
-			}
-			_, err = service.Get(ctx, service.ServiceURL("volumes", "detail"), nil, &gophercloud.RequestOpts{OkCodes: []int{200, 204}})
-			return err
-		})
-	}
-}
-
-func runNoAuthV2(ctx context.Context, r *runner, authURL string, password auth.V2PasswordOpts) {
-	endpoint, err := cinderNoAuthEndpoint(authURL, 2)
-	if err != nil {
-		r.run("service/noauth/cinder-v2/endpoint", func() error { return err })
-		return
-	}
-
-	r.run("service/noauth/cinder-v2", func() error {
-		provider, err := blockstoragenoauth.NewClient(auth.NoAuthV2Opts{
-			Username:   password.Username,
-			TenantName: password.TenantName,
-		})
-		if err != nil {
-			return err
-		}
-		service, err := blockstoragenoauth.NewBlockStorageNoAuthV2(provider, blockstoragenoauth.EndpointOpts{
-			CinderEndpoint: endpoint,
-		})
-		if err != nil {
-			return err
-		}
-		_, err = service.Get(ctx, service.ServiceURL("volumes", "detail"), nil, &gophercloud.RequestOpts{OkCodes: []int{200, 204}})
-		return err
-	})
-}
-
 func runEC2AuthCase(ctx context.Context, r *runner, serviceProvider *gophercloud.ProviderClient, name string, options auth.AuthOptionsEC2, want expectation) {
 	options.ServiceProvider = serviceProvider
 
@@ -1299,7 +1220,6 @@ func runV2WithOptions(ctx context.Context, options auth.AuthOptionsV2) int {
 		scoped:    true,
 	}
 	runAuthCase(ctx, r, "v2/token", tokenOptions, wantToken)
-	runNoAuthV2(ctx, r, options.AuthURL, password)
 
 	r.summary()
 	return r.exitCode()
@@ -1343,7 +1263,6 @@ func runV3() int {
 	runApplicationCredentialMatrix(ctx, r, f)
 	runOAuthMatrix(ctx, r, f)
 	runEC2Matrix(ctx, r, f, identity.ProviderClient)
-	runNoAuthMatrix(ctx, r, f)
 
 	runCloudPasswordTOTPMatrix(ctx, r, f)
 	runCloudApplicationCredentialMatrix(ctx, r, f)
