@@ -932,6 +932,16 @@ func runCloudPasswordMatrix(ctx context.Context, r *runner, f fixtureData) {
 	}
 }
 
+func cloudTokenOptions(authURL, token string, scope *auth.Scope) (auth.Authenticator, error) {
+	data, err := cloudAuthData(authURL, auth.V3TokenOpts{Token: token}, scope)
+	if err != nil {
+		return nil, err
+	}
+	// The cloud loader defaults allow_reauth to true when the field is absent.
+	// Token credentials cannot be refreshed, so override that default.
+	return authOptionsFromTempCloud("", auth.AuthV3Token, data, auth.WithAllowReauth(false))
+}
+
 func runCloudTokenMatrix(ctx context.Context, r *runner, f fixtureData) {
 	adminToken, err := unscopedToken(ctx, f, false)
 	if err != nil {
@@ -950,12 +960,8 @@ func runCloudTokenMatrix(ctx context.Context, r *runner, f fixtureData) {
 			token = trusteeToken
 			expectedUser = f.userID
 		}
-		data, dataErr := cloudAuthData(f.authURL, auth.V3TokenOpts{Token: token}, scope.scope)
 		build := func(context.Context) (auth.Authenticator, error) {
-			if dataErr != nil {
-				return nil, dataErr
-			}
-			return authOptionsFromTempCloud("", auth.AuthV3Token, data)
+			return cloudTokenOptions(f.authURL, token, scope.scope)
 		}
 		want := expectationForScope(scope, tokenAuthMethods(), expectedUser, false)
 		runAuthCaseBuilder(ctx, r, "clouds.yaml/v3/token/"+scope.name, build, want)
