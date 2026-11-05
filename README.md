@@ -26,7 +26,13 @@ The v3 run creates temporary Keystone resources and cleans
 them up; the admin account needs permission to create users, assign roles,
 and create trusts and credentials.
 
-Combinations of the following options are used in the coverage:
+Combinations of the following options are used in the coverage.
+The runner also constructs complete JSON bodies and signatures independently of
+`auth` request builders, then submits them through the raw identity endpoint
+APIs: v2 `tokens.Create` (`-version 2`) and v3 `tokens.Create`,
+`oauth1.Create` (PLAINTEXT), and `ec2tokens.Create` (AWS signature v2)
+(`-version 3`). Run `go test ./...` to exercise these requests against a local
+HTTP test server without Keystone credentials.
 
 ### Keystone v3 (`-version 3`)
 

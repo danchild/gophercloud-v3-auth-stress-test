@@ -5,7 +5,9 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base32"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -24,11 +26,14 @@ import (
 	"github.com/gophercloud/gophercloud/v2/auth"
 	"github.com/gophercloud/gophercloud/v2/openstack"
 	"github.com/gophercloud/gophercloud/v2/openstack/config/clouds"
+	tokensV2 "github.com/gophercloud/gophercloud/v2/openstack/identity/v2/tokens"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/applicationcredentials"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/credentials"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/ec2credentials"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/ec2tokens"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/oauth1"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/roles"
+	tokensV3 "github.com/gophercloud/gophercloud/v2/openstack/identity/v3/tokens"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/trusts"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/users"
 	"go.yaml.in/yaml/v3"
@@ -1178,6 +1183,87 @@ func runEC2Matrix(ctx context.Context, r *runner, f fixtureData, serviceProvider
 	}
 }
 
+// These four probes deliberately construct raw bodies independently of auth's
+// request builders, then exercise the public identity endpoint methods.
+func rawV2Password(ctx context.Context, endpoint string, f fixtureData) error {
+	client := &gophercloud.ServiceClient{ProviderClient: &gophercloud.ProviderClient{}, Endpoint: gophercloud.NormalizeURL(endpoint)}
+	request := gophercloud.RawRequest{Body: map[string]any{"auth": map[string]any{
+		"passwordCredentials": map[string]any{"username": f.username, "password": f.password},
+		"tenantId":            f.projectID,
+	}}}
+	result, err := tokensV2.Create(ctx, client, request).ExtractToken()
+	if err != nil {
+		return err
+	}
+	if result.ID == "" {
+		return errors.New("v2 raw request returned an empty token ID")
+	}
+	return nil
+}
+
+func rawV3Password(ctx context.Context, client *gophercloud.ServiceClient, f fixtureData) error {
+	request := gophercloud.RawRequest{Body: map[string]any{"auth": map[string]any{
+		"identity": map[string]any{"methods": []string{"password"}, "password": map[string]any{"user": map[string]any{"id": f.userID, "password": f.password}}},
+		"scope":    map[string]any{"project": map[string]any{"id": f.projectID}},
+	}}}
+	result, err := tokensV3.Create(ctx, client, request).Extract()
+	if err != nil {
+		return err
+	}
+	if result.ID == "" {
+		return errors.New("v3 raw request returned an empty token ID")
+	}
+	return nil
+}
+
+func rawOAuth(ctx context.Context, client *gophercloud.ServiceClient, f fixtureData) error {
+	access := f.oauthAccess[oauth1.PLAINTEXT]
+	if access == nil {
+		return errors.New("missing OAuth1 PLAINTEXT access token")
+	}
+	nonceBytes := make([]byte, 16)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		return err
+	}
+	nonce := hex.EncodeToString(nonceBytes)
+	// PLAINTEXT signs the percent-encoded consumer and access-token secrets.
+	signature := url.QueryEscape(url.QueryEscape(f.oauthConsumerSecret) + "&" + url.QueryEscape(access.OAuthTokenSecret))
+	header := fmt.Sprintf(`OAuth oauth_consumer_key=%q, oauth_nonce=%q, oauth_signature_method="PLAINTEXT", oauth_timestamp=%q, oauth_token=%q, oauth_version="1.0", oauth_signature=%q`,
+		url.QueryEscape(f.oauthConsumerID), url.QueryEscape(nonce), fmt.Sprint(time.Now().UTC().Unix()), url.QueryEscape(access.OAuthToken), signature)
+	request := gophercloud.RawRequest{
+		Body:    map[string]any{"auth": map[string]any{"identity": map[string]any{"methods": []string{"oauth1"}, "oauth1": map[string]any{}}}},
+		Headers: map[string]string{"Authorization": header},
+	}
+	result, err := oauth1.Create(ctx, client, request).Extract()
+	if err != nil {
+		return err
+	}
+	if result.ID == "" {
+		return errors.New("OAuth1 raw request returned an empty token ID")
+	}
+	return nil
+}
+
+func rawEC2(ctx context.Context, client *gophercloud.ServiceClient, f fixtureData) error {
+	params := map[string]string{"Action": "Test", "SignatureMethod": "HmacSHA256", "SignatureVersion": "2"}
+	// AWS signature v2: verb, host, path, then sorted canonical query parameters.
+	message := "GET\nlocalhost\n/\nAction=Test&SignatureMethod=HmacSHA256&SignatureVersion=2"
+	mac := hmac.New(sha256.New, []byte(f.ec2Secret))
+	_, _ = mac.Write([]byte(message))
+	request := gophercloud.RawRequest{Body: map[string]any{"credentials": map[string]any{
+		"access": f.ec2Access, "host": "localhost", "path": "/", "verb": "GET",
+		"params": params, "signature": base64.StdEncoding.EncodeToString(mac.Sum(nil)),
+	}}}
+	result, err := ec2tokens.Create(ctx, client, request).Extract()
+	if err != nil {
+		return err
+	}
+	if result.ID == "" {
+		return errors.New("EC2 raw request returned an empty token ID")
+	}
+	return nil
+}
+
 func runV2WithOptions(ctx context.Context, options auth.AuthOptionsV2) int {
 	r := newRunner()
 
@@ -1209,6 +1295,9 @@ func runV2WithOptions(ctx context.Context, options auth.AuthOptionsV2) int {
 		scoped:    true,
 	}
 	runAuthCase(ctx, r, "v2/password", options, wantPassword)
+	r.run("raw/v2/tokens/password", func() error {
+		return rawV2Password(ctx, options.GetAuthURL(), fixtureData{username: password.Username, password: password.Password, projectID: initial.Project.ID})
+	})
 
 	tokenOptions := auth.AuthOptionsV2{
 		AuthURL: options.AuthURL,
@@ -1269,6 +1358,9 @@ func runV3() int {
 	runApplicationCredentialMatrix(ctx, r, f)
 	runOAuthMatrix(ctx, r, f)
 	runEC2Matrix(ctx, r, f, identity.ProviderClient)
+	r.run("raw/v3/tokens/password", func() error { return rawV3Password(ctx, identity, f) })
+	r.run("raw/v3/oauth1/PLAINTEXT", func() error { return rawOAuth(ctx, identity, f) })
+	r.run("raw/v3/ec2tokens/v2-hmac-sha256", func() error { return rawEC2(ctx, identity, f) })
 
 	runCloudPasswordTOTPMatrix(ctx, r, f)
 	runCloudApplicationCredentialMatrix(ctx, r, f)

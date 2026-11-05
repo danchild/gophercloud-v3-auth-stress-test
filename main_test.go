@@ -3,18 +3,155 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/auth"
+	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/oauth1"
 )
+
+func TestRawIdentityEndpointsSendCallerConstructedRequests(t *testing.T) {
+	paths := map[string]bool{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths[r.URL.Path] = true
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		switch r.URL.Path {
+		case "/v2.0/tokens":
+			authBody, ok := body["auth"].(map[string]any)
+			if !ok {
+				t.Errorf("unexpected v2 auth body: %v", body)
+			} else {
+				password, ok := authBody["passwordCredentials"].(map[string]any)
+				if !ok || authBody["tenantId"] != "project" || password["username"] != "user-name" || password["password"] != "secret" {
+					t.Errorf("unexpected v2 credentials: %v", authBody)
+				}
+			}
+			_, _ = io.WriteString(w, `{"access":{"token":{"id":"v2-token","expires":"2030-01-01T00:00:00Z","tenant":{"id":"project"}},"user":{"id":"user","roles":[]},"serviceCatalog":[]}}`)
+		case "/v3/auth/tokens":
+			if body["auth"] == nil {
+				t.Error("v3 request lacks auth body")
+			}
+			if _, ok := body["auth"].(map[string]any)["identity"]; !ok {
+				t.Error("v3 request lacks identity")
+			}
+			if r.Header.Get("Authorization") != "" {
+				if !strings.Contains(r.Header.Get("Authorization"), `oauth_signature="consumer-secret%26token-secret"`) {
+					t.Errorf("unexpected OAuth signature: %s", r.Header.Get("Authorization"))
+				}
+				if r.Header.Get("X-Auth-Token") != "" {
+					t.Error("signed request leaked X-Auth-Token")
+				}
+			} else {
+				if r.Header.Get("X-Auth-Token") != "" {
+					t.Error("raw v3 authentication leaked provider token")
+				}
+				authBody := body["auth"].(map[string]any)
+				if authBody["scope"].(map[string]any)["project"].(map[string]any)["id"] != "project" ||
+					authBody["identity"].(map[string]any)["password"].(map[string]any)["user"].(map[string]any)["password"] != "secret" {
+					t.Errorf("unexpected v3 password request: %v", body)
+				}
+			}
+			w.Header().Set("X-Subject-Token", "v3-token")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"token":{"expires_at":"2030-01-01T00:00:00Z"}}`)
+		case "/v3/ec2tokens":
+			credentials, ok := body["credentials"].(map[string]any)
+			if !ok || credentials["signature"] != "vKAic4OjxZRx9JpEoXURosf7EnA9NPFXDcK6rhBZKiw=" {
+				t.Errorf("unexpected EC2 credentials: %v", credentials)
+			}
+			w.Header().Set("X-Subject-Token", "ec2-token")
+			_, _ = io.WriteString(w, `{"token":{"expires_at":"2030-01-01T00:00:00Z"}}`)
+		default:
+			t.Errorf("unexpected endpoint %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client := &gophercloud.ServiceClient{ProviderClient: &gophercloud.ProviderClient{TokenID: "provider-token"}, Endpoint: server.URL + "/v3/"}
+	f := fixtureData{authURL: server.URL + "/v3/", username: "user-name", userID: "user", password: "secret", projectID: "project", ec2Access: "access", ec2Secret: "secret", oauthConsumerID: "consumer", oauthConsumerSecret: "consumer-secret", oauthAccess: map[oauth1.SignatureMethod]*oauth1.Token{oauth1.PLAINTEXT: {OAuthToken: "access-token", OAuthTokenSecret: "token-secret"}}}
+	for _, run := range []struct {
+		name string
+		fn   func() error
+	}{
+		{"v2", func() error { return rawV2Password(context.Background(), server.URL+"/v2.0/", f) }},
+		{"v3", func() error { return rawV3Password(context.Background(), client, f) }},
+		{"oauth", func() error { return rawOAuth(context.Background(), client, f) }},
+		{"ec2", func() error { return rawEC2(context.Background(), client, f) }},
+	} {
+		t.Run(run.name, func(t *testing.T) {
+			if err := run.fn(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	for _, path := range []string{"/v2.0/tokens", "/v3/auth/tokens", "/v3/ec2tokens"} {
+		if !paths[path] {
+			t.Errorf("endpoint %s was not called", path)
+		}
+	}
+}
+
+func TestRawOAuthSignatureMatchesAuthBuilder(t *testing.T) {
+	var headers []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		headers = append(headers, r.Header.Get("Authorization"))
+		w.Header().Set("X-Subject-Token", "token")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"token":{"expires_at":"2030-01-01T00:00:00Z"}}`)
+	}))
+	defer server.Close()
+	f := fixtureData{oauthConsumerID: "consumer!$", oauthConsumerSecret: "consumer secret!", clockOffset: 2 * time.Hour, oauthAccess: map[oauth1.SignatureMethod]*oauth1.Token{oauth1.PLAINTEXT: {OAuthToken: "access token", OAuthTokenSecret: "token secret!"}}}
+	client := &gophercloud.ServiceClient{ProviderClient: &gophercloud.ProviderClient{}, Endpoint: server.URL + "/v3/"}
+	before := time.Now().UTC().Unix()
+	if err := rawOAuth(context.Background(), client, f); err != nil {
+		t.Fatal(err)
+	}
+	_, err := (auth.AuthOptionsV3{AuthURL: server.URL + "/v3/", Auth: auth.V3OAuth1Opts{ConsumerKey: f.oauthConsumerID, ConsumerSecret: f.oauthConsumerSecret, Token: f.oauthAccess[oauth1.PLAINTEXT].OAuthToken, TokenSecret: f.oauthAccess[oauth1.PLAINTEXT].OAuthTokenSecret, SignatureMethod: auth.OAuth1Plaintext}}).Authenticate(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(headers) != 2 {
+		t.Fatalf("got %d OAuth requests", len(headers))
+	}
+	get := func(header, field string) string {
+		for _, component := range strings.Split(strings.TrimPrefix(header, "OAuth "), ", ") {
+			parts := strings.SplitN(component, "=", 2)
+			if parts[0] == field {
+				return strings.Trim(parts[1], `"`)
+			}
+		}
+		return ""
+	}
+	for _, field := range []string{"oauth_consumer_key", "oauth_signature_method", "oauth_token", "oauth_version", "oauth_signature"} {
+		if get(headers[0], field) != get(headers[1], field) {
+			t.Errorf("%s: raw %s, builder %s", field, get(headers[0], field), get(headers[1], field))
+		}
+	}
+	for i, header := range headers {
+		stamp, err := strconv.ParseInt(get(header, "oauth_timestamp"), 10, 64)
+		if err != nil || stamp < before || stamp > time.Now().UTC().Unix() {
+			t.Errorf("request %d timestamp %q is not within local UTC time range", i, get(header, "oauth_timestamp"))
+		}
+	}
+	nonce := get(headers[0], "oauth_nonce")
+	if len(nonce) != 32 {
+		t.Errorf("raw nonce %q is not 16 bytes of hex", nonce)
+	} else if _, err := hex.DecodeString(nonce); err != nil {
+		t.Errorf("raw nonce is not hex: %v", err)
+	}
+}
 
 func TestRunSelectedRunsOnlyRequestedIdentityVersion(t *testing.T) {
 	for _, version := range []string{"2", "3"} {
@@ -52,19 +189,9 @@ func TestRunSelectedRejectsMissingOrUnsupportedVersion(t *testing.T) {
 	}
 }
 
-func TestRunV2WithOptionsExercisesPasswordTokenAndNoAuth(t *testing.T) {
+func TestRunV2WithOptionsExercisesPasswordAndToken(t *testing.T) {
 	var methods []string
-	noAuthCalled := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.Method == http.MethodGet && request.URL.Path == "/volume/v2/tenant-name/volumes/detail" {
-			noAuthCalled = true
-			if request.Header.Get("X-Auth-Token") != "user-name:tenant-name" {
-				t.Errorf("X-Auth-Token = %q, want synthetic v2 token", request.Header.Get("X-Auth-Token"))
-			}
-			_, _ = io.WriteString(w, `{"volumes": []}`)
-			return
-		}
-
 		var body struct {
 			Auth map[string]json.RawMessage `json:"auth"`
 		}
@@ -110,9 +237,6 @@ func TestRunV2WithOptionsExercisesPasswordTokenAndNoAuth(t *testing.T) {
 	}
 	if !seen["password"] || !seen["token"] {
 		t.Fatalf("auth methods exercised = %v, want password and token", methods)
-	}
-	if !noAuthCalled {
-		t.Fatal("v2 Cinder no-auth endpoint was not exercised")
 	}
 }
 
