@@ -27,6 +27,7 @@ import (
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/auth"
 	"github.com/gophercloud/gophercloud/v2/openstack"
+	openstackConfig "github.com/gophercloud/gophercloud/v2/openstack/config"
 	"github.com/gophercloud/gophercloud/v2/openstack/config/clouds"
 	tokensV2 "github.com/gophercloud/gophercloud/v2/openstack/identity/v2/tokens"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/applicationcredentials"
@@ -364,37 +365,54 @@ func cloudAuthData(authURL string, credentials any, scope *auth.Scope) (map[stri
 }
 
 func authOptionsFromTempCloud(dir string, authType auth.AuthType, authData map[string]any, opts ...auth.CloudOption) (auth.Authenticator, error) {
+	options, _, err := authOptionsAndTLSFromTempCloud(dir, authType, authData, "", opts...)
+	return options, err
+}
+
+func authOptionsAndTLSFromTempCloud(dir string, authType auth.AuthType, authData map[string]any, caCertFile string, opts ...auth.CloudOption) (auth.Authenticator, *tls.Config, error) {
 	tempDir, err := os.MkdirTemp(dir, "gophercloud-cloud-*")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer os.RemoveAll(tempDir)
 
 	file, err := os.CreateTemp(tempDir, "clouds-*.yaml")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	name := file.Name()
 
 	config := clouds.Clouds{Clouds: map[string]clouds.Cloud{
-		"gophercloud-auth-test": {AuthType: authType, Auth: authData},
+		"gophercloud-auth-test": {AuthType: authType, Auth: authData, CACertFile: caCertFile},
 	}}
 	if err := yaml.NewEncoder(file).Encode(config); err != nil {
 		_ = file.Close()
-		return nil, err
+		return nil, nil, err
 	}
 	if err := file.Close(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	cloud, _, _, err := clouds.Parse(
+	// The generated YAML's cacert must win over any OS_CACERT in the admin
+	// environment, so this case actually tests the YAML setting.
+	if caCertFile != "" {
+		previous, present := os.LookupEnv("OS_CACERT")
+		_ = os.Unsetenv("OS_CACERT")
+		defer func() {
+			if present {
+				_ = os.Setenv("OS_CACERT", previous)
+			}
+		}()
+	}
+	cloud, _, tlsConfig, err := clouds.Parse(
 		clouds.WithCloudName("gophercloud-auth-test"),
 		clouds.WithLocations(name),
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return cloud.ToAuthOptions(opts...)
+	options, err := cloud.ToAuthOptions(append(opts, auth.WithTLSConfig(tlsConfig))...)
+	return options, tlsConfig, err
 }
 
 func runAuthCase(ctx context.Context, r *runner, name string, options auth.Authenticator, want expectation) {
@@ -447,6 +465,136 @@ func runAuthCaseBuilder(ctx context.Context, r *runner, name string, build authC
 		}
 		return nil
 	})
+}
+
+// runGenericAuthMatrix exercises version discovery for both generic auth types
+// through environment and generated clouds.yaml configuration.
+var cloudCACertFile string
+
+func runGenericAuthMatrix(ctx context.Context, r *runner, version string, passwordData, tokenData map[string]any, wantPassword, wantToken expectation) {
+	if version == "2" {
+		// Prove generic password and token select v2 through discovery, not an
+		// OS_IDENTITY_API_VERSION inherited from the admin OpenRC.
+		previous, present := os.LookupEnv("OS_IDENTITY_API_VERSION")
+		_ = os.Unsetenv("OS_IDENTITY_API_VERSION")
+		defer func() {
+			if present {
+				_ = os.Setenv("OS_IDENTITY_API_VERSION", previous)
+			}
+		}()
+	}
+	for _, test := range []struct {
+		method string
+		data   map[string]any
+		want   expectation
+	}{
+		{"password", passwordData, wantPassword},
+		{"token", tokenData, wantToken},
+	} {
+		assertVersion := func(options auth.Authenticator, err error) (auth.Authenticator, error) {
+			if err != nil {
+				return nil, err
+			}
+			switch version {
+			case "2":
+				if _, ok := options.(auth.AuthOptionsV2); !ok {
+					return nil, fmt.Errorf("generic %s selected %T, want v2", test.method, options)
+				}
+			case "3":
+				if _, ok := options.(auth.AuthOptionsV3); !ok {
+					return nil, fmt.Errorf("generic %s selected %T, want v3", test.method, options)
+				}
+			}
+			return options, nil
+		}
+		envBuild := func(context.Context) (auth.Authenticator, error) {
+			// Keep the admin environment intact, including any previously selected auth type.
+			values := map[string]string{"OS_AUTH_TYPE": test.method}
+			if cloudCACertFile != "" {
+				values["OS_CACERT"] = cloudCACertFile
+			}
+			for field, key := range map[string]string{
+				"OS_AUTH_URL": "auth_url", "OS_USERNAME": "username", "OS_USERID": "user_id",
+				"OS_PASSWORD": "password", "OS_TOKEN": "token",
+				"OS_PROJECT_ID": "project_id", "OS_PROJECT_NAME": "project_name",
+				"OS_TENANT_ID": "project_id", "OS_TENANT_NAME": "project_name",
+				"OS_USER_DOMAIN_ID": "user_domain_id", "OS_USER_DOMAIN_NAME": "user_domain_name",
+				"OS_PROJECT_DOMAIN_ID": "project_domain_id", "OS_PROJECT_DOMAIN_NAME": "project_domain_name",
+				"OS_DOMAIN_ID": "domain_id", "OS_DOMAIN_NAME": "domain_name",
+				"OS_SYSTEM_SCOPE": "system_scope", "OS_TRUST_ID": "trust_id",
+			} {
+				values[field], _ = test.data[key].(string)
+			}
+			original := make(map[string]string, len(values))
+			present := make(map[string]bool, len(values))
+			for key, value := range values {
+				original[key], present[key] = os.LookupEnv(key)
+				if err := os.Setenv(key, value); err != nil {
+					return nil, err
+				}
+			}
+			defer func() {
+				for key := range values {
+					if present[key] {
+						_ = os.Setenv(key, original[key])
+					} else {
+						_ = os.Unsetenv(key)
+					}
+				}
+			}()
+			return assertVersion(auth.AuthOptionsFromEnv())
+		}
+		runAuthCaseBuilder(ctx, r, "env/"+version+"/"+test.method, envBuild, test.want)
+		cloudBuild := func() (auth.Authenticator, *tls.Config, error) {
+			options, tlsConfig, err := authOptionsAndTLSFromTempCloud("", auth.AuthType(test.method), test.data, cloudCACertFile)
+			options, err = assertVersion(options, err)
+			return options, tlsConfig, err
+		}
+		name := "clouds.yaml/" + version + "/" + test.method
+		r.run(name+"/AuthResult", func() error {
+			options, tlsConfig, err := cloudBuild()
+			if err != nil {
+				return err
+			}
+			provider := &gophercloud.ProviderClient{}
+			transport := http.DefaultTransport.(*http.Transport).Clone()
+			transport.TLSClientConfig = tlsConfig
+			provider.HTTPClient.Transport = transport
+			result, err := options.Authenticate(ctx, provider)
+			if err != nil {
+				return err
+			}
+			return validateAuthResult(result, test.want)
+		})
+		r.run(name+"/ProviderClient", func() error {
+			options, tlsConfig, err := cloudBuild()
+			if err != nil {
+				return err
+			}
+			provider, err := openstackConfig.NewProviderClient(ctx, options, openstackConfig.WithTLSConfig(tlsConfig))
+			if err != nil {
+				return err
+			}
+			result, ok := provider.GetAuthResult().(*auth.AuthResult)
+			if !ok {
+				return fmt.Errorf("ProviderClient auth result has type %T", provider.GetAuthResult())
+			}
+			if err := validateAuthResult(result, test.want); err != nil {
+				return err
+			}
+			if test.want.canReauth != nil && *test.want.canReauth {
+				if provider.ReauthFunc == nil {
+					return errors.New("reauthentication requested but ReauthFunc is nil")
+				}
+				if err := provider.ReauthFunc(ctx); err != nil {
+					return fmt.Errorf("reauthentication failed: %w", err)
+				}
+			} else if provider.ReauthFunc != nil {
+				return errors.New("unexpected ReauthFunc")
+			}
+			return nil
+		})
+	}
 }
 
 func randomString(prefix string) (string, error) {
@@ -1318,6 +1466,17 @@ func runV2WithOptions(ctx context.Context, options auth.AuthOptionsV2) int {
 	}
 	runAuthCase(ctx, r, "v2/token", tokenOptions, wantToken)
 
+	// A versionless v2 OpenRC may advertise stable v3 alongside deprecated
+	// v2. Point generic auth at the v2 endpoint so discovery chooses v2
+	// without OS_IDENTITY_API_VERSION.
+	passwordData, passwordErr := cloudAuthData(options.GetAuthURL(), password, nil)
+	tokenData, tokenErr := cloudAuthData(options.GetAuthURL(), tokenOptions.Auth, nil)
+	if passwordErr != nil || tokenErr != nil {
+		r.run("setup/v2-generic-auth", func() error { return errors.Join(passwordErr, tokenErr) })
+	} else {
+		runGenericAuthMatrix(ctx, r, "2", passwordData, tokenData, wantPassword, wantToken)
+	}
+
 	r.summary()
 	return r.exitCode()
 }
@@ -1353,6 +1512,23 @@ func runV3() int {
 	runTOTPMatrix(ctx, r, f)
 	runCloudPasswordMatrix(ctx, r, f)
 	runCloudTokenMatrix(ctx, r, f)
+	genericToken, genericErr := unscopedToken(ctx, f, false)
+	if genericErr != nil {
+		r.run("setup/v3-generic-token", func() error { return genericErr })
+	} else {
+		scope := scopeCase{name: "project-id", scope: &auth.Scope{ProjectID: f.projectID}, projectID: f.projectID}
+		passwordData, passwordErr := cloudAuthData(f.authURL, passwordOptions(f, "user-id", scope.scope, true, false).Auth, scope.scope)
+		tokenData, tokenErr := cloudAuthData(f.authURL, auth.V3TokenOpts{Token: genericToken}, scope.scope)
+		if passwordErr != nil || tokenErr != nil {
+			r.run("setup/v3-generic-auth", func() error { return errors.Join(passwordErr, tokenErr) })
+		} else {
+			passwordData["allow_reauth"] = true
+			tokenData["allow_reauth"] = false
+			runGenericAuthMatrix(ctx, r, "3", passwordData, tokenData,
+				expectationForScope(scope, []auth.AuthType{auth.AuthPassword}, f.userID, true),
+				expectationForScope(scope, tokenAuthMethods(), f.userID, false))
+		}
+	}
 	runCloudMultifactorMatrix(ctx, r, f)
 	runCloudTOTPMatrix(ctx, r, f)
 
@@ -1418,6 +1594,9 @@ func runSelected(args []string, stderr io.Writer, runners map[string]func() int)
 		transport.TLSClientConfig.RootCAs = roots
 		http.DefaultTransport = transport
 	}
+	oldCACertFile := cloudCACertFile
+	cloudCACertFile = *caCert
+	defer func() { cloudCACertFile = oldCACertFile }()
 	return run()
 }
 

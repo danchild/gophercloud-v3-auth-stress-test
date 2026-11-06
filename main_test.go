@@ -14,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -305,6 +306,11 @@ func TestRunSelectedRejectsMissingOrUnsupportedVersion(t *testing.T) {
 func TestRunV2WithOptionsExercisesPasswordAndToken(t *testing.T) {
 	var methods []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"versions":{"values":[{"id":"v3.8","status":"stable","links":[{"rel":"self","href":"http://%s/v3/"}]},{"id":"v2.0","status":"deprecated","links":[{"rel":"self","href":"http://%s/v2.0/"}]}]}}`, request.Host, request.Host)
+			return
+		}
 		var body struct {
 			Auth map[string]json.RawMessage `json:"auth"`
 		}
@@ -350,6 +356,163 @@ func TestRunV2WithOptionsExercisesPasswordAndToken(t *testing.T) {
 	}
 	if !seen["password"] || !seen["token"] {
 		t.Fatalf("auth methods exercised = %v, want password and token", methods)
+	}
+}
+
+func TestGenericAuthMatrixDiscoversVersionAndAuthenticates(t *testing.T) {
+	for _, tc := range []struct {
+		name, version string
+		tls, yamlOnly bool
+	}{
+		{"https-v3", "3", true, false}, {"http-v3", "3", false, false}, {"http-v2", "2", false, false},
+		{"https-v3-yaml-only", "3", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var discoveries atomic.Int32
+			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodGet {
+					discoveries.Add(1)
+					if tc.version == "2" {
+						if value, present := os.LookupEnv("OS_IDENTITY_API_VERSION"); present {
+							t.Errorf("v2 discovery depends on OS_IDENTITY_API_VERSION=%q; want it unset", value)
+						}
+					}
+					base := "http://" + r.Host
+					if tc.tls {
+						base = "https://" + r.Host
+					}
+					suffix := "/v3/"
+					id := "v3.14"
+					if tc.version == "2" {
+						suffix, id = "/v2.0/", "v2.0"
+					}
+					fmt.Fprintf(w, `{"versions":{"values":[{"id":%q,"status":"stable","links":[{"rel":"self","href":%q}]}]}}`, id, base+suffix)
+					return
+				}
+				var body map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+					w.WriteHeader(400)
+					return
+				}
+				authBody := body["auth"].(map[string]any)
+				if tc.version == "2" {
+					if r.URL.Path != "/v2.0/tokens" {
+						t.Errorf("v2 path = %s", r.URL.Path)
+					}
+					method := "passwordCredentials"
+					if _, ok := authBody["token"]; ok {
+						method = "token"
+					}
+					if _, ok := authBody[method]; !ok {
+						t.Errorf("unexpected v2 auth body: %v", authBody)
+					}
+					if authBody["tenantId"] == "<nil>" || (authBody["tenantId"] != "project" && authBody["tenantName"] != "project") {
+						t.Errorf("incorrect v2 project scope: %v", authBody)
+					}
+					_, _ = io.WriteString(w, `{"access":{"token":{"id":"issued","expires":"2030-01-01T00:00:00Z","tenant":{"id":"project"}},"user":{"id":"user","roles":[]},"serviceCatalog":[{"name":"nova","type":"compute","endpoints":[{"publicURL":"http://compute.example"}]}]}}`)
+					return
+				}
+				if r.URL.Path != "/v3/auth/tokens" {
+					t.Errorf("v3 path = %s", r.URL.Path)
+				}
+				identity := authBody["identity"].(map[string]any)
+				methods := identity["methods"].([]any)
+				method := methods[0].(string)
+				if _, ok := identity[method]; !ok {
+					t.Errorf("missing %s credentials", method)
+				}
+				history := `["password"]`
+				if method == "token" {
+					history = `["password","token"]`
+				}
+				w.Header().Set("X-Subject-Token", "issued")
+				w.WriteHeader(http.StatusCreated)
+				fmt.Fprintf(w, `{"token":{"methods":%s,"expires_at":"2030-01-01T00:00:00Z","user":{"id":"user"},"project":{"id":"project"},"catalog":[{"id":"compute","type":"compute","endpoints":[]}]}}`, history)
+			})
+			var server *httptest.Server
+			if tc.tls {
+				server = httptest.NewTLSServer(handler)
+			} else {
+				server = httptest.NewServer(handler)
+			}
+			defer server.Close()
+			originalTransport := http.DefaultTransport
+			defer func() { http.DefaultTransport = originalTransport }()
+			ca := ""
+			if tc.tls {
+				ca = t.TempDir() + "/ca.pem"
+				if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("OS_AUTH_URL", server.URL)
+			t.Setenv("OS_USERNAME", "user")
+			t.Setenv("OS_PASSWORD", "secret")
+			t.Setenv("OS_PROJECT_ID", "")
+			t.Setenv("OS_PROJECT_NAME", "")
+			t.Setenv("OS_TOKEN", "issued")
+			t.Setenv("OS_USER_DOMAIN_NAME", "Default")
+			t.Setenv("OS_CACERT", "")
+			if tc.tls && !tc.yamlOnly {
+				t.Setenv("OS_CACERT", t.TempDir()+"/invalid-ca.pem")
+			}
+			t.Setenv("OS_AUTH_TYPE", "")
+			if tc.version == "2" {
+				t.Setenv("OS_IDENTITY_API_VERSION", "3")
+			}
+			password := map[string]any{"auth_url": server.URL, "username": "user", "password": "secret", "allow_reauth": true}
+			token := map[string]any{"auth_url": server.URL, "token": "issued", "allow_reauth": tc.version == "2"}
+			if tc.version == "3" {
+				password["user_domain_name"] = "Default"
+				password["project_id"] = "project"
+				token["project_id"] = "project"
+			} else {
+				password["project_name"] = "project"
+				token["project_name"] = "project"
+			}
+			wantPassword := expectation{userID: "user", projectID: "project", scoped: true, canReauth: boolPtr(true)}
+			wantToken := expectation{userID: "user", projectID: "project", scoped: true, canReauth: boolPtr(false)}
+			if tc.version == "3" {
+				wantPassword.methods = []auth.AuthType{auth.AuthPassword}
+				wantToken.methods = tokenAuthMethods()
+			} else {
+				wantToken.canReauth = boolPtr(true)
+			}
+			args := []string{"-version", tc.version}
+			if ca != "" && !tc.yamlOnly {
+				args = append(args, "-cacert", ca)
+			}
+			var stderr bytes.Buffer
+			code := runSelected(args, &stderr, map[string]func() int{tc.version: func() int {
+				runner := newRunner()
+				if tc.yamlOnly {
+					cloudCACertFile = ca
+					defer func() { cloudCACertFile = "" }()
+				}
+				runGenericAuthMatrix(context.Background(), runner, tc.version, password, token, wantPassword, wantToken)
+				if tc.version == "2" && os.Getenv("OS_IDENTITY_API_VERSION") != "3" {
+					t.Error("generic matrix did not restore OS_IDENTITY_API_VERSION")
+				}
+				if tc.yamlOnly {
+					if runner.passed != 4 || runner.failed != 4 {
+						t.Errorf("YAML-only CA: %d passed, %d failed; want cloud cases to pass, env cases to fail", runner.passed, runner.failed)
+					}
+					if got := discoveries.Load(); got != 8 {
+						t.Errorf("discovery requests = %d, want 8 (including 4 through OS_CACERT)", got)
+					}
+					return 0
+				}
+				if runner.passed != 8 || runner.failed != 0 {
+					t.Errorf("generic matrix: %d passed, %d failed", runner.passed, runner.failed)
+				}
+				return runner.exitCode()
+			}})
+			if code != 0 {
+				t.Fatalf("exit=%d: %s", code, stderr.String())
+			}
+		})
 	}
 }
 

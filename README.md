@@ -42,6 +42,16 @@ scheme. A CA certificate alone does not change the server's endpoint setting.
 `main.go` reads the admin credentials from the `OS_*` environment variables.
 The `clouds.yaml` cases create temporary files inline using those credentials
 and test credentials derived from the `env` vars, so you do not need to supply one.
+Both versions test generic `password` and `token` auth through `OS_*` and
+`clouds.yaml`, including identity version selection. The v2 generic cases use
+the versioned `/v2.0/` endpoint derived from the admin auth URL and temporarily
+unset `OS_IDENTITY_API_VERSION`; a versionless endpoint that advertises stable
+v3 and deprecated v2 would otherwise select v3. For HTTPS with `-cacert`,
+the generic environment cases set `OS_CACERT` while loading auth options, and
+the generated YAML entries contain `cacert`; its parsed TLS configuration is
+used for both discovery and authentication. Run v3 once with HTTPS and
+`-cacert`, once with HTTP, and run v2 with HTTP to cover all three modes.
+The token cases use a token issued from password credentials, not `OS_TOKEN`.
 The v3 run creates temporary Keystone resources and cleans
 them up; the admin account needs permission to create users, assign roles,
 and create trusts and credentials.
