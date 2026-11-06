@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +19,7 @@ import (
 
 	"github.com/gophercloud/gophercloud/v2"
 	"github.com/gophercloud/gophercloud/v2/auth"
+	"github.com/gophercloud/gophercloud/v2/openstack"
 	"github.com/gophercloud/gophercloud/v2/openstack/identity/v3/oauth1"
 )
 
@@ -169,6 +172,116 @@ func TestRunSelectedRunsOnlyRequestedIdentityVersion(t *testing.T) {
 				t.Fatalf("called runners = %v, want only version %s", called, version)
 			}
 		})
+	}
+}
+
+func TestRunSelectedCACertCoversAuthenticationPaths(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/health" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.URL.Path != "/v2.0/tokens" {
+			t.Errorf("path = %s, want /v2.0/tokens", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"access":{"token":{"id":"issued-token","expires":"2030-01-01T00:00:00Z"},"user":{"id":"user-id","name":"user-name","roles":[]},"serviceCatalog":[]}}`)
+	}))
+	defer server.Close()
+	originalTransport := http.DefaultTransport
+	defer func() { http.DefaultTransport = originalTransport }()
+	certPath := t.TempDir() + "/ca.pem"
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	options := auth.AuthOptionsV2{AuthURL: server.URL, Auth: auth.V2PasswordOpts{Username: "user", Password: "password", AllowReauth: true}}
+	check := func() int {
+		if _, err := options.Authenticate(context.Background(), nil); err != nil {
+			return 1
+		}
+		provider, err := openstack.AuthenticatedClient(context.Background(), options)
+		if err != nil || provider.ReauthFunc == nil {
+			return 1
+		}
+		if err := provider.ReauthFunc(context.Background()); err != nil {
+			return 1
+		}
+		response, err := http.DefaultClient.Get(server.URL + "/health")
+		if err != nil {
+			return 1
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			return 1
+		}
+		return 0
+	}
+	var stderr bytes.Buffer
+	if got := runSelected([]string{"-version", "2"}, &stderr, map[string]func() int{"2": check}); got == 0 {
+		t.Fatal("authentication succeeded without the CA")
+	}
+	stderr.Reset()
+	if got := runSelected([]string{"-version", "2", "-cacert", certPath}, &stderr, map[string]func() int{"2": check}); got != 0 {
+		t.Fatalf("authentication with CA exited %d: %s", got, stderr.String())
+	}
+}
+
+func TestRunSelectedCACertCoversGenericDiscovery(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/identity/" {
+			t.Errorf("discovery path = %s, want /identity/", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"versions":{"values":[{"id":"v3.14","status":"stable","links":[{"rel":"self","href":%q}]}]}}`, server.URL+"/identity/v3/")
+	}))
+	defer server.Close()
+	originalTransport := http.DefaultTransport
+	defer func() { http.DefaultTransport = originalTransport }()
+	certPath := t.TempDir() + "/ca.pem"
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OS_AUTH_URL", server.URL+"/identity/")
+	t.Setenv("OS_AUTH_TYPE", "password")
+	t.Setenv("OS_USERNAME", "user")
+	t.Setenv("OS_PASSWORD", "password")
+	t.Setenv("OS_PROJECT_NAME", "project")
+	t.Setenv("OS_USER_DOMAIN_NAME", "Default")
+	t.Setenv("OS_PROJECT_DOMAIN_NAME", "Default")
+	t.Setenv("OS_CACERT", "")
+	check := func() int {
+		if _, err := auth.AuthOptionsFromEnv(); err != nil {
+			return 1
+		}
+		return 0
+	}
+	var stderr bytes.Buffer
+	if got := runSelected([]string{"-version", "3"}, &stderr, map[string]func() int{"3": check}); got == 0 {
+		t.Fatal("generic discovery succeeded without the CA")
+	}
+	if got := runSelected([]string{"-version", "3", "-cacert", certPath}, &stderr, map[string]func() int{"3": check}); got != 0 {
+		t.Fatalf("generic discovery with CA exited %d: %s", got, stderr.String())
+	}
+}
+
+func TestRunSelectedRejectsInvalidCACertBeforeRunning(t *testing.T) {
+	originalTransport := http.DefaultTransport
+	defer func() { http.DefaultTransport = originalTransport }()
+	for _, path := range []string{"/no/such/ca.pem", t.TempDir() + "/invalid.pem"} {
+		if strings.Contains(path, "invalid.pem") {
+			if err := os.WriteFile(path, []byte("not a certificate"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		called := false
+		var stderr bytes.Buffer
+		if got := runSelected([]string{"-version", "2", "-cacert", path}, &stderr, map[string]func() int{"2": func() int { called = true; return 0 }}); got != 2 || called || stderr.Len() == 0 {
+			t.Fatalf("path %q: exit=%d called=%v stderr=%q", path, got, called, stderr.String())
+		}
+		if http.DefaultTransport != originalTransport {
+			t.Fatal("invalid CA changed default transport")
+		}
 	}
 }
 

@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/binary"
@@ -1383,6 +1385,7 @@ func runSelected(args []string, stderr io.Writer, runners map[string]func() int)
 	flags := flag.NewFlagSet("client", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	version := flags.String("version", "", "identity API version to test (2 or 3)")
+	caCert := flags.String("cacert", "", "PEM CA certificate to trust for HTTPS requests")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -1392,6 +1395,28 @@ func runSelected(args []string, stderr io.Writer, runners map[string]func() int)
 		fmt.Fprintln(stderr, "-version must be 2 or 3")
 		flags.Usage()
 		return 2
+	}
+	if *caCert != "" {
+		cert, err := os.ReadFile(*caCert)
+		if err != nil {
+			fmt.Fprintf(stderr, "read -cacert: %v\n", err)
+			return 2
+		}
+		roots, err := x509.SystemCertPool()
+		if err != nil {
+			fmt.Fprintf(stderr, "load system certificate pool: %v\n", err)
+			return 2
+		}
+		if !roots.AppendCertsFromPEM(cert) {
+			fmt.Fprintln(stderr, "-cacert contains no valid PEM certificates")
+			return 2
+		}
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{}
+		}
+		transport.TLSClientConfig.RootCAs = roots
+		http.DefaultTransport = transport
 	}
 	return run()
 }

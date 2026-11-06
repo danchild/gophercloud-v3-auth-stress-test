@@ -11,13 +11,33 @@ client from this directory:
 
 ```sh
 # Against keystone v3
-source ./admin-openrc.sh 
-go run main.go -version 3
+source ./admin-openrc-v3.sh
+go run . -version 3
 
 # Against keystone v2
-source ./admin-openrc.sh 
-go run main.go -version 2
+source ./admin-openrc-v2.sh
+go run . -version 2
 ```
+
+For an HTTPS Keystone endpoint signed by a private CA, pass the optional
+`-cacert` flag with a PEM CA certificate. It applies to direct authentication,
+provider-based authentication, reauthentication, and raw HTTP requests in this
+process. Without the flag, the normal system trust store is used; certificate
+verification is never disabled. For example, to test the DevStack HTTPS proxy:
+
+```sh
+source admin-openrc-v3.sh
+export OS_AUTH_URL=https://10.0.78.90/identity/
+go run . -version 3 -cacert ./devstack-ca.pem
+```
+
+`devstack-ca.pem` contains only the public CA certificate for this test server,
+not the server's private key. Replace it if the DevStack CA is rotated (current
+certificate expires in November 2027).
+
+For the full v3 matrix behind a TLS-terminating proxy, Keystone must also
+advertise an HTTPS `public_endpoint`: OAuth1 HMAC signatures include the URL
+scheme. A CA certificate alone does not change the server's endpoint setting.
 
 `main.go` reads the admin credentials from the `OS_*` environment variables.
 The `clouds.yaml` cases create temporary files inline using those credentials
